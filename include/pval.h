@@ -1,10 +1,27 @@
 #ifndef _PVAL_H_
 #define _PVAL_H_
-
 /* 
  * pval.h
- * Pval Netlink Parameters
  */
+
+#ifndef __KERNEL__
+#include <asm/types.h>
+#endif
+
+/* Pval IP Option */
+#define IPOPT_PVAL      222 /* reserved for Experimental use in RFC4727 */
+
+/* Pval IP Option */
+struct ipopt_pval {
+        __u8      type;
+        __u8      length;
+        __u16     reserved;
+        __u64     seq;
+} __attribute__ ((__packed__));
+
+
+
+/* Netlink parameters */
 
 
 enum {

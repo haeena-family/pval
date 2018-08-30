@@ -36,6 +36,7 @@
 #include "ip.h"
 #include "ipproto.h"
 
+#include "../include/pval.h"
 
 static const struct tok ip_option_values[] = {
     { IPOPT_EOL, "EOL" },
@@ -47,6 +48,7 @@ static const struct tok ip_option_values[] = {
     { IPOPT_LSRR, "LSRR" },
     { IPOPT_RA, "RA" },
     { IPOPT_RFC1393, "traceroute" },
+    { IPOPT_PVAL, "pval" },
     { 0, NULL }
 };
 
@@ -240,6 +242,26 @@ trunc:
 	return (-1);
 }
 
+static int
+ip_printpval(netdissect_options *ndo,
+	     const u_char *cp, u_int length)
+{
+	const struct ipopt_pval *ipp;
+
+	if (length < sizeof(struct ipopt_pval)) {
+		ND_PRINT("[bad length %u]", length);
+		return (0);
+	}
+
+	ipp = (const struct ipopt_pval *)cp;
+	ND_PRINT(" seq %llu", ipp->seq);
+
+	return (0);
+
+trunc:
+	return (-1);
+}
+
 /*
  * print IP options.
    If truncated return -1, else 0.
@@ -307,6 +329,11 @@ ip_optprint(netdissect_options *ndo,
 			ND_TCHECK_1(cp + 3);
 			if (EXTRACT_BE_U_2(cp + 2) != 0)
 				ND_PRINT(" value %u", EXTRACT_BE_U_2(cp + 2));
+			break;
+
+		case IPOPT_PVAL:
+			if (ip_printpval(ndo, cp, option_len) == -1)
+				goto trunc;
 			break;
 
 		case IPOPT_NOP:       /* nothing to print - fall through */

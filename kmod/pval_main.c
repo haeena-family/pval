@@ -20,17 +20,6 @@
 #undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-/* Pval IP Option */
-#define IPOPT_PVAL	222 /* reserved for Experimental use in RFC4727 */
-
-struct ipopt_pval {
-	u8	type;
-	u8	length;
-	u16	reserved;
-	u64	seq;
-} __attribute__ ((__packed__));
-
-
 
 /* structure describing pval device */
 struct pval_dev {
