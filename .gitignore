@@ -46,3 +46,5 @@ Module.symvers
 *.pcap
 
 core
+
+reset.sh

@@ -93,10 +93,15 @@ rx_handler_result_t pdev_handle_frame(struct sk_buff **pskb)
 	struct pval_dev *pdev = rcu_dereference(skb->dev->rx_handler_data);
 	
 	/* XXX: put the packet and rx hwtstamp to the buffer exposed to user */
-	skb->dev = pdev->dev;
-	netif_rx(skb);
+	skb = skb_share_check(skb, GFP_ATOMIC);
+	if (!skb)
+		return RX_HANDLER_CONSUMED;
 
-	return RX_HANDLER_CONSUMED;
+	*pskb = skb;
+	skb->dev = pdev->dev;
+	skb->pkt_type = PACKET_HOST;
+
+	return RX_HANDLER_ANOTHER;
 }
 
 
@@ -121,16 +126,25 @@ static int pval_open(struct net_device *dev)
 	int rc = 0;
 	struct pval_dev *pdev = netdev_priv(dev);
 
-	rtnl_lock();
 	if (netdev_is_rx_handler_busy(pdev->link)) {
-		pr_err("Rx Handler of %s is busy. Cannot open %s\n",
+		pr_info("Rx Handler of %s is busy. Cannot open %s\n",
 		       pdev->link->name, pdev->dev->name);
 		rc = -EBUSY;
 	} else {
-		netdev_rx_handler_register(dev, pdev_handle_frame, pdev);
+		pr_info("Register RX handler for %s\n", pdev->link->name);
+		netdev_rx_handler_register(pdev->link,  pdev_handle_frame,
+					   pdev);
 	}
-	rtnl_unlock();
 
+	/* set link device all multi and promisc */
+	rc = dev_set_promiscuity(pdev->link, 1);
+	if (rc < 0)
+		goto err_out;
+
+	return rc;
+
+err_out:
+	netdev_rx_handler_unregister(pdev->link);
 	return rc;
 }
 
@@ -138,9 +152,8 @@ static int pval_stop(struct net_device *dev)
 {
 	struct pval_dev *pdev = netdev_priv(dev);
 
-	rtnl_lock();
 	netdev_rx_handler_unregister(pdev->link);
-	rtnl_unlock();
+	dev_set_promiscuity(pdev->link, -1);
 
 	return 0;
 }
@@ -156,6 +169,14 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 	eth_old = (struct ethhdr *)skb_mac_header(skb);
 	iph_old = (struct iphdr *)skb_network_header(skb);
 
+	if (ntohs(eth_old->h_proto) != ETH_P_IP)
+		goto xmit;
+
+	if (skb_cow_head(skb, sizeof(struct ipopt_pval))) {
+		pr_err("skb_cow_head failed\n");
+		kfree_skb(skb);
+		return NETDEV_TX_OK;
+	}
 	__skb_push(skb, sizeof(struct ipopt_pval));
 	skb_reset_mac_header(skb);
 	skb_set_network_header(skb, sizeof(struct ethhdr));
@@ -183,13 +204,12 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   0));
 
 	/* Xmit this packet through under device */
+xmit:
 	skb->dev = pdev->link;
-	dev_queue_xmit(skb);
+	return dev_queue_xmit(skb);
 
 	/* XXX: Gather hwtstamp here */
 	/* XXX: Put the cloned packet to the buffer exposing user space */
-
-	return NETDEV_TX_OK;
 }
 
 
@@ -233,11 +253,12 @@ static void pval_setup(struct net_device *dev) {
         //dev->features   |= NETIF_F_RXCSUM;
         //dev->features   |= NETIF_F_GSO_SOFTWARE;
 
-	dev->vlan_features = dev->features;
+	// dev->vlan_features = dev->features;
         // dev->hw_features |= NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_RXCSUM;
         // dev->hw_features |= NETIF_F_GSO_SOFTWARE;
-        netif_keep_dst(dev);
+        // netif_keep_dst(dev);
         dev->priv_flags |= IFF_NO_QUEUE;
+	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
 
 	/* MTU range: 68 - 65535 */
         dev->min_mtu = ETH_MIN_MTU;
@@ -257,6 +278,8 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	struct pval_net *pnet = net_generic(src_net, pval_net_id);
 	struct pval_dev *pdev = netdev_priv(dev);
 
+	pdev->dev = dev;
+
 	/* check underlay link */
 	if (data && data[IFLA_PVAL_LINK]) {
 		ifindex = nla_get_u32(data[IFLA_PVAL_LINK]);
@@ -264,7 +287,7 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	}
 	if (!link) {
 		NL_SET_ERR_MSG(extack, "Invalid ifindex for underlay link");
-		return -EINVAL;
+		return -ENODEV;
 	}
 	pdev->link = link;
 
@@ -281,9 +304,17 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 		return err;
 	}
 
+	err = netdev_upper_dev_link(link, dev, extack);
+	if (err)
+		goto unregister_netdev;
+
 	list_add_tail_rcu(&pdev->list, &pnet->dev_list);
 
 	return 0;
+
+unregister_netdev:
+	unregister_netdevice(dev);
+	return err;
 }
 
 static int pval_changelink(struct net_device *dev, struct nlattr *tb[],
@@ -300,6 +331,7 @@ static void pval_dellink(struct net_device *dev, struct list_head *head)
 	dev_put(pdev->link);
 	list_del_rcu(&pdev->list);
 	unregister_netdevice_queue(dev, head);
+	netdev_upper_dev_unlink(pdev->link, dev);
 }
 
 
