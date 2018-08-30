@@ -181,6 +181,7 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 	ipp->type	= IPOPT_PVAL;
 	ipp->length	= sizeof(struct ipopt_pval);
 	ipp->reserved	= 0;
+	ipp->cpu	= smp_processor_id();
 	ipp->seq	= pdev->seq++;
 
 	iph_new->ihl	+= sizeof(struct ipopt_pval) >> 2;

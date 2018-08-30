@@ -13,10 +13,11 @@
 
 /* Pval IP Option */
 struct ipopt_pval {
-        __u8      type;
-        __u8      length;
-        __u16     reserved;
-        __u64     seq;
+	__u8 	type;
+	__u8	length;
+	__u8	reserved;
+	__u8	cpu;
+	__u64	seq;
 } __attribute__ ((__packed__));
 
 

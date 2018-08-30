@@ -254,7 +254,7 @@ ip_printpval(netdissect_options *ndo,
 	}
 
 	ipp = (const struct ipopt_pval *)cp;
-	ND_PRINT(" seq %llu", ipp->seq);
+	ND_PRINT(" cpu %u, seq %llu", ipp->cpu, ipp->seq);
 
 	return (0);
 
