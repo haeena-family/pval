@@ -119,6 +119,7 @@ static int pval_open(struct net_device *dev)
 		pr_info("Rx Handler of %s is busy. Cannot open %s\n",
 		       pdev->link->name, pdev->dev->name);
 		rc = -EBUSY;
+		goto out;
 	} else {
 		pr_info("Register RX handler for %s\n", pdev->link->name);
 		netdev_rx_handler_register(pdev->link,  pdev_handle_frame,
@@ -130,6 +131,7 @@ static int pval_open(struct net_device *dev)
 	if (rc < 0)
 		goto err_out;
 
+out:
 	return rc;
 
 err_out:
@@ -432,7 +434,7 @@ static void __exit pval_exit_module(void)
 	rtnl_link_unregister(&pval_link_ops);
 	unregister_pernet_subsys(&pval_net_ops);
 
-	pr_info("Unload Pval Module (%s)\n", PVAL_VERSION);
+	pr_info("Unload Pval Module (v%s)\n", PVAL_VERSION);
 }
 module_exit(pval_exit_module);
 
