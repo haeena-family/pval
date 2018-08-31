@@ -18,7 +18,7 @@ $ sudo apt install xtables-addons-source flex bison
 $ cd pval/iproute2-4.18.0
 $ ./configure
 $ make
-$ ./ip/ip link add type pval help  <17:40>
+$ ./ip/ip link add type pval help
 Usage: ... pval link PHYS_DEV
                  [ ipopt { on | off } ]
                  [ txtstamp { on | off } ]
