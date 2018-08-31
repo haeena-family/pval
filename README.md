@@ -1,8 +1,8 @@
 
 
-### Pval kernel module
+## Pval kernel module
 
-1. Compile and install pval.ko
+### 1. Compile and install pval.ko
 
 ```shell-session
 $ git clone https://github.com/haeena-family/pval
@@ -11,7 +11,7 @@ $ make
 $ sudo insmod pval.ko
 ```
 
-2. Compile the modified iproute2
+### 2. Compile the modified iproute2
 
 ```shell-session
 $ sudo apt install xtables-addons-source flex bison
@@ -45,7 +45,7 @@ packets to pval0 are transmitted through enp0s9. This relationship is
 similar to ethernet and bridge interfaces.
 
 
-3. Configure pval0 interface
+### 3. Configure pval0 interface
 
 ```shell-session
 $ sudo ./ip/ip link set dev pval0 type pval ipopt on
@@ -61,7 +61,7 @@ options are shown in the help (but not implemented currently).  These
 options can be specified at link creation by `ip link add`.
 
 
-4. what's happen
+### 4. What's happen
 
 Pval interface embeds IP Pval Option (experimental option 222) into
 all transmitted packets. pval/tcpdump is capable to see this option.
@@ -86,7 +86,7 @@ ICMP echo reply packets from 10.0.0.3 (pval0) to 10.0.0.2 have Pval
 options.
 
 
-5. Gathring copied packets
+### 5. Gathring copied packets
 
 `txcopy` and `rxcopy` copy TXed and RXed packets through the pval
 interfaces. You can optain the copied packets from the Pval character
@@ -110,3 +110,24 @@ tools/dump-one.c is a sample application. An iovec contains a `struct
 pval_slot` as a structured buffer, and `writev()` returns how many
 packets are read. This method diverts schatter gather I/O to bulked
 packet transfer.
+
+```shell-session
+$ cd pval
+$ sudo ./iproute2-4.18.0/ip/ip link set dev pval0 type pval txcopy on rxcopy on
+$ cd tools
+$ make
+$ sudo ./dump-one /dev/pval/pval0-rx-cpu-0
+0 08:00:27:19:12:a4 -> ea:51:d7:0c:95:1a Type0800, 10.0.0.2 -> 10.0.0.3
+0 08:00:27:19:12:a4 -> ea:51:d7:0c:95:1a Type0800, 10.0.0.2 -> 10.0.0.3
+0 08:00:27:19:12:a4 -> ea:51:d7:0c:95:1a Type0800, 10.0.0.2 -> 10.0.0.3
+0 08:00:27:19:12:a4 -> ea:51:d7:0c:95:1a Type0800, 10.0.0.2 -> 10.0.0.3
+^C
+$ sudo ./dump-one /dev/pval/pval0-tx-cpu-0
+0 ea:51:d7:0c:95:1a -> 08:00:27:19:12:a4 Type0806
+0 ea:51:d7:0c:95:1a -> 08:00:27:19:12:a4 Type0800, 10.0.0.3 -> 10.0.0.2
+0 ea:51:d7:0c:95:1a -> 08:00:27:19:12:a4 Type0800, 10.0.0.3 -> 10.0.0.2
+0 ea:51:d7:0c:95:1a -> 08:00:27:19:12:a4 Type0806
+0 ea:51:d7:0c:95:1a -> 08:00:27:19:12:a4 Type0800, 10.0.0.3 -> 10.0.0.2
+0 ea:51:d7:0c:95:1a -> 08:00:27:19:12:a4 Type0800, 10.0.0.3 -> 10.0.0.2
+^C
+```
