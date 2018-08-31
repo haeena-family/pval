@@ -32,15 +32,6 @@ const static struct net_device_ops pdev_netdev_ops;
 
 
 /* structures describing pval ring buffer */
-#define PVAL_PKT_LEN	256
-
-struct pval_slot {
-	u32	len;
-	u64	tstamp;
-	char	pkt[PVAL_PKT_LEN];
-} __attribute__((__packed__));
-
-
 struct pval_ring {
 	u8	cpu;
 	u32	head;	/* write point */
@@ -58,6 +49,10 @@ struct pval_ring {
 struct pval_mdev {
 	char	name[PVAL_NAME_MAX];	/* IFNAM-{tx|rx}-cpu-%d */
 	int	cpu;			/* CPU where this ring allocated */
+	bool	opened;			/* This miscdev is opend.
+					 * XXX: this should be atmoic value
+					 * to avoid race condition.
+					 */
 
 	struct pval_ring	ring;
 	struct miscdevice	mdev;
@@ -89,15 +84,15 @@ struct pval_dev {
 	/* @original_config: config before pval manipulates */
 	struct hwtstamp_config original_config;
 
-
 	/* misc device structures */
 	int num_cpus;
 	struct pval_mdev txmdevs[PVAL_MAX_CPUS];
 	struct pval_mdev rxmdevs[PVAL_MAX_CPUS];
 };
-#define pdev_tx_ring(pdev) &(pdev->txmdevs[smp_processor_id()].ring)
-#define pdev_rx_ring(pdev) &(pdev->rxmdevs[smp_processor_id()].ring)
-
+#define pdev_tx_ring(pdev) (&((pdev)->txmdevs[smp_processor_id()].ring))
+#define pdev_rx_ring(pdev) (&((pdev)->rxmdevs[smp_processor_id()].ring))
+#define pdev_tx_pmdev(pdev) (&((pdev)->txmdevs[smp_processor_id()]))
+#define pdev_rx_pmdev(pdev) (&((pdev)->rxmdevs[smp_processor_id()]))
 
 /* netns parameters */
 static unsigned int pval_net_id;
@@ -150,17 +145,26 @@ static inline u32 ring_write_avail(const struct pval_ring *r)
 	return 0;	// full
 }
 
+static inline void ring_zero(struct pval_ring *r)
+{
+	r->head = 0;
+	r->tail = 0;
+}
+
 static inline ssize_t write_to_ring(struct pval_ring *r, struct sk_buff *skb)
 {
 	u32 pktlen = skb->mac_len + skb->len;
 	u32 copylen = pktlen > PVAL_PKT_LEN ? PVAL_PKT_LEN : pktlen;
+	struct pval_slot *s;
 
 	if (ring_full(r))
 		return 0;
 
-	r->slots[r->head].len = copylen;
-	r->slots[r->head].tstamp = skb_hwtstamps(skb)->hwtstamp;
-	memcpy(r->slots[r->head].pkt, skb_mac_header(skb), copylen);
+	s = &r->slots[r->head];
+
+	s->len = copylen;
+	s->tstamp = skb_hwtstamps(skb)->hwtstamp;
+	memcpy(s->pkt, skb_mac_header(skb), copylen);
 	ring_write_next(r);
 
 	return copylen;
@@ -168,21 +172,27 @@ static inline ssize_t write_to_ring(struct pval_ring *r, struct sk_buff *skb)
 
 static int pval_file_open(struct inode *inode, struct file *filp)
 {
-	int cpu;
-	char devname[IFNAMSIZ], direct[16];
+	int cpu, n;
+	char devname[IFNAMSIZ], direct[16], buf[PVAL_NAME_MAX];
 	struct net_device *dev;
 	struct pval_dev *pdev;
+	struct pval_mdev *pmdev;
 
-	if (sscanf(filp->f_path.dentry->d_name.name, "%s-%s-cpu-%d",
-		   devname, direct, &cpu) < 1) {
-		pr_err("failed to parse char dev %s\n",
-		       filp->f_path.dentry->d_name.name);
+	/* copy and change chardev to be capable of sscanf */
+	strncpy(buf, filp->f_path.dentry->d_name.name, PVAL_NAME_MAX);
+	for (n = 0; n < strlen(buf); n++) {
+		if (buf[n] == '-')
+			buf[n] = ' ';
+	}
+	if (sscanf(buf, "%s %s cpu %d", devname, direct, &cpu) < 1) {
+		pr_err("%s: failed to parse char dev %s\n",
+		       __func__, filp->f_path.dentry->d_name.name);
 		return -EINVAL;
 	}
 
-	dev = dev_get_by_name(&init_net, devname);
+	dev = __dev_get_by_name(&init_net, devname); // Do not dev_hold()
 	if (!dev) {
-		pr_err("net device %s not found\n", devname);
+		pr_err("netdevice %s not found\n", devname);
 		return -ENODEV;
 	}
 
@@ -200,22 +210,35 @@ static int pval_file_open(struct inode *inode, struct file *filp)
 	}
 
 	if (strncmp(direct, "tx", 2) == 0)
-		filp->private_data = &pdev->txmdevs[cpu];
+		pmdev = &pdev->txmdevs[cpu];
 	else if (strncmp(direct, "rx", 2) == 0)
-		filp->private_data = &pdev->rxmdevs[cpu];
+		pmdev = &pdev->rxmdevs[cpu];
 	else {
 		pr_err("invalid direction %s of %s\n", direct,
 		       filp->f_path.dentry->d_name.name);
 		return -EINVAL;
 	}
 
+	if (pmdev->opened) {
+		pr_err("this miscdevice %s is already opened\n",
+		       filp->f_path.dentry->d_name.name);
+		return -EBUSY;
+	}
+
+	pmdev->opened = true;
+	ring_zero(&pmdev->ring);	// flush the ring
+	filp->private_data = pmdev;
+
 	return 0;
 }
-
 
 static int
 pval_file_release(struct inode *inode, struct file *filp)
 {
+	struct pval_mdev *pmdev = (struct pval_mdev *)filp->private_data;
+
+	ring_zero(&pmdev->ring);	// flush the ring
+	pmdev->opened = false;
 	filp->private_data = NULL;
 	return 0;
 }
@@ -301,10 +324,11 @@ static int pval_init_miscdevice(struct pval_mdev *pmdev, char *name, int cpu)
 	int rc;
 
 	strncpy(pmdev->name, name, PVAL_NAME_MAX);
-	pmdev->mdev.name = pmdev->name;
-	pmdev->mdev.minor = MISC_DYNAMIC_MINOR;
-	pmdev->mdev.fops = &pval_fops;
-	pmdev->cpu = cpu;
+	pmdev->cpu		= cpu;
+	pmdev->opened		= false;
+	pmdev->mdev.name	= pmdev->name;
+	pmdev->mdev.minor	= MISC_DYNAMIC_MINOR;
+	pmdev->mdev.fops	= &pval_fops;
 
 	rc = pval_init_ring(&pmdev->ring, cpu);
 	if (rc < 0) {
@@ -473,7 +497,7 @@ rx_handler_result_t pdev_handle_frame(struct sk_buff **pskb)
 	skb->dev = pdev->dev;
 	skb->pkt_type = PACKET_HOST;
 
-	if (pdev->rxcopy)
+	if (pdev->rxcopy && pdev_rx_pmdev(pdev)->opened)
 		write_to_ring(pdev_rx_ring(pdev), skb);
 
 	return RX_HANDLER_ANOTHER;
@@ -594,16 +618,14 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   sizeof(struct ipopt_pval),
 					   0));
 
-	if (pdev->txcopy)
+xmit:
+	/* XXX: Gather hwtstamp here */
+	if (pdev->txcopy && pdev_tx_pmdev(pdev)->opened)
 		write_to_ring(pdev_tx_ring(pdev), skb);
 
 	/* Xmit this packet through under device */
-xmit:
 	skb->dev = pdev->link;
 	return dev_queue_xmit(skb);
-
-	/* XXX: Gather hwtstamp here */
-	/* XXX: Put the cloned packet to the buffer exposing user space */
 }
 
 

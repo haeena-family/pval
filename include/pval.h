@@ -44,4 +44,19 @@ enum {
 };
 #define PVAL_ATTR_MAX	(__PVAL_ATTR_MAX)
 
+
+/* Pval ring buffer structures */
+
+#define PVAL_PKT_LEN	256
+
+/* pval_slot is stored in each iovec by readv() syscall */
+struct pval_slot {
+	__u32	len;
+	__u64	tstamp;
+	char	pkt[PVAL_PKT_LEN];
+} __attribute__((__packed__));
+
+
+
+
 #endif /* _PVAL_H_ */
