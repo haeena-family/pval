@@ -88,7 +88,7 @@ ICMP echo reply packets from 10.0.0.3 (pval0) to 10.0.0.2 have Pval
 options.
 
 
-### 5. Gathring copied packets
+### 5. Gathering copied packets
 
 `txcopy` and `rxcopy` copy TXed and RXed packets through the pval
 interfaces. You can obtain the copied packets from the Pval character
