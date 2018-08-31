@@ -11,6 +11,8 @@
 #include <net/rtnetlink.h>
 #include <net/genetlink.h>
 #include <net/ip_tunnels.h>
+#include <uapi/linux/if.h>
+#include <uapi/linux/net_tstamp.h>
 #include <asm/string.h>
 
 #include <pval.h>
@@ -29,6 +31,17 @@ struct pval_dev {
 
 	struct net_device	*link;	/* underlay link this pval hiring */
 	u64 __percpu		 seq;	/* sequence for TXed packets */
+
+	/* on/off switches for functionalities */
+	bool run;
+	bool ipopt;
+	bool txtstamp;
+	bool rxtstamp;
+	bool txcopy;
+	bool rxcopy;
+
+	/* @original_config: config before pval manipulates */
+	struct hwtstamp_config original_config;
 };
 
 
@@ -72,6 +85,91 @@ wrapsum(u_int32_t sum)
 {
         sum = ~sum & 0xFFFF;
         return (htons(sum));
+}
+
+
+#define netdev_ioctl(d, i, c) (d)->netdev_ops->ndo_do_ioctl(d, i, c)
+
+static int pval_save_tstamp_config(struct pval_dev *pdev)
+{
+	int rc;
+	struct hwtstamp_config config;
+	struct ifreq ifr;
+
+	if (!pdev->link->netdev_ops->ndo_do_ioctl) {
+		pr_err("%s does not support ioctl\n", pdev->link->name);
+		return -EINVAL;
+	}
+
+	/* save the current hwtstamp config to pdev->original */
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, pdev->link->name, IFNAMSIZ);
+	ifr.ifr_data = &config;
+
+	rc = netdev_ioctl(pdev->link, &ifr, SIOCGHWTSTAMP);
+	if (rc) {
+		pr_err("%s: %s failed to get hwtstamp config\n",
+		       __func__, pdev->link->name);
+		return rc;
+	}
+
+	pdev->original_config = config;
+
+	return 0;
+}
+
+static int pval_restore_tstamp_config(struct pval_dev *pdev)
+{
+	int rc = 0;
+	struct ifreq ifr;
+
+	if (!pdev->link->netdev_ops->ndo_do_ioctl) {
+		pr_err("%s does not support ioctl\n", pdev->link->name);
+		return -EINVAL;
+	}
+
+	/* set the hwtstamp config from pdev->original_config */
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, pdev->link->name, IFNAMSIZ);
+	ifr.ifr_data = &pdev->original_config;
+
+	rc = netdev_ioctl(pdev->link, &ifr, SIOCSHWTSTAMP);
+	if (rc)
+		pr_err("%s: %s failed to set hwtstamp config\n",
+		       __func__, pdev->link->name);
+
+	return rc;
+}
+
+
+static int pval_set_tstamp_config(struct pval_dev *pdev)
+{
+	int rc = 0;
+	struct hwtstamp_config config;
+	struct ifreq ifr;
+
+	if (!pdev->link->netdev_ops->ndo_do_ioctl) {
+		pr_err("%s does not support ioctl\n", pdev->link->name);
+		return -EINVAL;
+	}
+
+	/* set the hwtstamp config by pdev parameters */
+	memset(&config, 0, sizeof(config));
+	if (pdev->txtstamp)
+		config.tx_type = HWTSTAMP_TX_ON;
+	if (pdev->rxtstamp)
+		config.rx_filter = HWTSTAMP_FILTER_ALL;
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, pdev->link->name, IFNAMSIZ);
+	ifr.ifr_data = &config;
+
+	rc = netdev_ioctl(pdev->link, &ifr, SIOCSHWTSTAMP);
+	if (rc)
+		pr_err("%s: %s failed to set hwtstamp config\n",
+		       __func__, pdev->link->name);
+
+	return rc;
 }
 
 
@@ -126,16 +224,27 @@ static int pval_open(struct net_device *dev)
 					   pdev);
 	}
 
+	/* save and configure hwtstamp */
+	rc = pval_save_tstamp_config(pdev);
+	if (rc < 0)
+		goto err_out1;
+	rc = pval_set_tstamp_config(pdev);
+	if (rc < 0)
+		goto err_out1;
+
+
 	/* set link device all multi and promisc */
 	rc = dev_set_promiscuity(pdev->link, 1);
 	if (rc < 0)
-		goto err_out;
+		goto err_out2;
 
-out:
 	return rc;
 
-err_out:
+err_out2:
+	pval_restore_tstamp_config(pdev);
+err_out1:
 	netdev_rx_handler_unregister(pdev->link);
+out:
 	return rc;
 }
 
@@ -145,6 +254,7 @@ static int pval_stop(struct net_device *dev)
 
 	netdev_rx_handler_unregister(pdev->link);
 	dev_set_promiscuity(pdev->link, -1);
+	pval_restore_tstamp_config(pdev);
 
 	return 0;
 }
@@ -155,6 +265,9 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct ethhdr *eth_old, *eth_new;
 	struct iphdr *iph_old, *iph_new;
 	struct ipopt_pval *ipp;
+
+	if (!pdev->ipopt)
+		goto xmit;
 
 	/* Advance eth+iph sizeof(struct ipopt_pval) bytes */
 	eth_old = (struct ethhdr *)skb_mac_header(skb);
@@ -270,7 +383,14 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	struct pval_net *pnet = net_generic(src_net, pval_net_id);
 	struct pval_dev *pdev = netdev_priv(dev);
 
-	pdev->dev = dev;
+	/* initialize pdev parameters */
+	pdev->dev	= dev;
+	pdev->run	= false;
+	pdev->ipopt	= false;
+	pdev->txtstamp	= false;
+	pdev->rxtstamp	= false;
+	pdev->txcopy	= false;
+	pdev->rxcopy	= false;
 
 	/* check underlay link */
 	if (data && data[IFLA_PVAL_LINK]) {
