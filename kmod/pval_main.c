@@ -224,25 +224,24 @@ static int pval_open(struct net_device *dev)
 					   pdev);
 	}
 
-	/* save and configure hwtstamp */
-	rc = pval_save_tstamp_config(pdev);
-	if (rc < 0)
-		goto err_out1;
-	rc = pval_set_tstamp_config(pdev);
-	if (rc < 0)
-		goto err_out1;
-
+	/* XXX: save and configure hwtstamp 
+	 * This should handle erros (mainy, -ENOTSUPP).
+	 * However, it resitrct development environment because
+	 * emulated e1000 devices do not suport hwtstamping.
+	 * Therefore, we ignore tstamp config errors.
+	 */
+	pval_save_tstamp_config(pdev);
+	pval_set_tstamp_config(pdev);
 
 	/* set link device all multi and promisc */
 	rc = dev_set_promiscuity(pdev->link, 1);
 	if (rc < 0)
-		goto err_out2;
+		goto err_out;
 
 	return rc;
 
-err_out2:
+err_out:
 	pval_restore_tstamp_config(pdev);
-err_out1:
 	netdev_rx_handler_unregister(pdev->link);
 out:
 	return rc;
@@ -254,7 +253,6 @@ static int pval_stop(struct net_device *dev)
 
 	netdev_rx_handler_unregister(pdev->link);
 	dev_set_promiscuity(pdev->link, -1);
-	pval_restore_tstamp_config(pdev);
 
 	return 0;
 }
@@ -372,6 +370,53 @@ static void pval_setup(struct net_device *dev) {
 	INIT_LIST_HEAD(&pdev->list);
 }
 
+static int pval_nl_config(struct pval_dev *pdev,
+			  struct nlattr *tb[], struct nlattr *data[],
+			  struct netlink_ext_ack *extack)
+{
+	/* XXX: 
+	 * Changing lower link is not supported.
+	 */
+
+	/* parse and load configurations */
+	if (data && data[IFLA_PVAL_IPOPT]) {
+		if (nla_get_u8(data[IFLA_PVAL_IPOPT]))
+			pdev->ipopt = true;
+		else
+			pdev->ipopt = false;
+	}
+
+	if (data && data[IFLA_PVAL_TXTSTAMP]) {
+		if (nla_get_u8(data[IFLA_PVAL_TXTSTAMP]))
+			pdev->txtstamp = true;
+		else
+			pdev->txtstamp = false;
+	}
+
+	if (data && data[IFLA_PVAL_RXTSTAMP]) {
+		if (nla_get_u8(data[IFLA_PVAL_RXTSTAMP]))
+			pdev->rxtstamp = true;
+		else
+			pdev->rxtstamp = false;
+	}
+
+	if (data && data[IFLA_PVAL_TXCOPY]) {
+		if (nla_get_u8(data[IFLA_PVAL_TXCOPY]))
+			pdev->txcopy = true;
+		else
+			pdev->txcopy = false;
+	}
+
+	if (data && data[IFLA_PVAL_RXCOPY]) {
+		if (nla_get_u8(data[IFLA_PVAL_RXCOPY]))
+			pdev->rxcopy = true;
+		else
+			pdev->rxcopy = false;
+	}
+	
+	return 0;
+}
+
 static int pval_newlink(struct net *src_net, struct net_device *dev,
 			struct nlattr *tb[], struct nlattr *data[],
 			struct netlink_ext_ack *extack)
@@ -391,6 +436,7 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	pdev->rxtstamp	= false;
 	pdev->txcopy	= false;
 	pdev->rxcopy	= false;
+	memset(&pdev->original_config, 0, sizeof(struct hwtstamp_config));
 
 	/* check underlay link */
 	if (data && data[IFLA_PVAL_LINK]) {
@@ -422,6 +468,8 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 
 	list_add_tail_rcu(&pdev->list, &pnet->dev_list);
 
+	pval_nl_config(pdev, tb, data, extack);
+
 	return 0;
 
 unregister_netdev:
@@ -433,13 +481,29 @@ static int pval_changelink(struct net_device *dev, struct nlattr *tb[],
 			   struct nlattr *data[],
 			   struct netlink_ext_ack *extack)
 {
-	return -ENOTSUPP;
+	struct pval_dev *pdev = netdev_priv(dev);
+	
+	if (data && data[IFLA_PVAL_LINK]) {
+		NL_SET_ERR_MSG(extack, "changing link is not supported\n");
+		return -ENOTSUPP;
+	}
+
+	pval_nl_config(pdev, tb, data, extack);;
+
+	/* XXX: update tstamp config 
+	 * should handle pval_*_tstamp_config errors here.
+	 */
+	pval_restore_tstamp_config(pdev);
+	pval_set_tstamp_config(pdev);
+
+	return 0;
 }
 
 static void pval_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct pval_dev *pdev = netdev_priv(dev);
 
+	pval_restore_tstamp_config(pdev);
 	dev_put(pdev->link);
 	list_del_rcu(&pdev->list);
 	unregister_netdevice_queue(dev, head);
@@ -459,6 +523,21 @@ static int pval_fill_info(struct sk_buff *skb, const struct net_device *dev)
 	struct pval_dev *pdev = netdev_priv(dev);
 
 	if (nla_put_u32(skb, IFLA_PVAL_LINK, pdev->link->ifindex))
+		return -EMSGSIZE;
+
+	if (nla_put_u8(skb, IFLA_PVAL_IPOPT, pdev->ipopt ? 1 : 0))
+		return -EMSGSIZE;
+
+	if (nla_put_u8(skb, IFLA_PVAL_TXTSTAMP, pdev->txtstamp ? 1 : 0))
+		return -EMSGSIZE;
+
+	if (nla_put_u8(skb, IFLA_PVAL_RXTSTAMP, pdev->rxtstamp ? 1 : 0))
+		return -EMSGSIZE;
+
+	if (nla_put_u8(skb, IFLA_PVAL_TXCOPY, pdev->txcopy ? 1 : 0))
+		return -EMSGSIZE;
+
+	if (nla_put_u8(skb, IFLA_PVAL_RXCOPY, pdev->rxcopy ? 1 : 0))
 		return -EMSGSIZE;
 
 	return 0;

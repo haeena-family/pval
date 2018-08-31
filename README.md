@@ -18,12 +18,24 @@ $ sudo apt install xtables-addons-source flex bison
 $ cd pval/iproute2-4.18.0
 $ ./configure
 $ make
+$ ./ip/ip link add type pval help  <17:40>
+Usage: ... pval link PHYS_DEV
+                 [ ipopt { on | off } ]
+                 [ txtstamp { on | off } ]
+                 [ rxtstamp { on | off } ]
+                 [ txcopy { on | off } ]
+                 [ rxcopy { on | off } ]
 $ sudo ./ip/ip link add type pval link enp0s9
 $ sudo ip -d link show dev pval0
 25: pval0: <BROADCAST,MULTICAST> mtu 1500 qdisc noqueue state DOWN mode DEFAULT group default qlen 1000
     link/ether 2e:4a:6f:78:49:09 brd ff:ff:ff:ff:ff:ff promiscuity 0 
     pval link enp0s9 addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535
 $ sudo ip link set dev pval0 up
+$ ip -d link show dev pval0
+39: pval0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/ether 92:b7:3a:2d:ff:e1 brd ff:ff:ff:ff:ff:ff promiscuity 0 
+    pval link enp0s9 ipopt off txtstamp off rxtstamp off txcopy off rxcopy off addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535
+
 $ sudo ip addr add dev pval0 10.0.0.3/24
 ```
 
@@ -33,7 +45,23 @@ packets to pval0 are transmitted through enp0s9. This relationship is
 similar to ethernet and bridge interfaces.
 
 
-3. what's happen
+3. Configure pval0 interface
+
+```shell-session
+$ sudo ./ip/ip link set dev pval0 type pval ipopt on
+$ ./ip/ip -d link show dev pval0
+39: pval0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/ether 92:b7:3a:2d:ff:e1 brd ff:ff:ff:ff:ff:ff promiscuity 0 
+    pval link enp0s9 ipopt on txtstamp off rxtstamp off txcopy off rxcopy off addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 
+```
+
+You can configure pval kernel module through `ip link set`. `ipopt on`
+enables inserting Pval IP Option to transmitting packets. Other
+options are shown in the help (but not implemented currently).  These
+options can be specified at link creation by `ip link add`.
+
+
+4. what's happen
 
 Pval interface embeds IP Pval Option (experimental option 222) into
 all transmitted packets. pval/tcpdump is capable to see this option.
