@@ -4,7 +4,7 @@ VERBOSE = 0
 
 obj-m := pval.o
 pval-objs := pval_main.o
-ccflags-y := -I$(src)/../include/
+ccflags-y := -I$(src)/../include/ -I$(src)/
 
 all:
 	make -C $(KERNELSRCDIR) M=$(BUILD_DIR) V=$(VERBOSE) modules

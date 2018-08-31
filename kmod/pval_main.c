@@ -11,19 +11,65 @@
 #include <net/rtnetlink.h>
 #include <net/genetlink.h>
 #include <net/ip_tunnels.h>
+#include <linux/miscdevice.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+#include <uapi/linux/limits.h>
 #include <uapi/linux/if.h>
 #include <uapi/linux/net_tstamp.h>
 #include <asm/string.h>
 
 #include <pval.h>
 
-#define PVAL_VERSION "0.0.1"
+#define PVAL_VERSION 	"0.0.1"
+#define DRV_NAME	"pval"
 
 #undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 
+const static struct net_device_ops pdev_netdev_ops;
+
+
+/* structures describing pval ring buffer */
+#define PVAL_PKT_LEN	256
+
+struct pval_slot {
+	u32	len;
+	u64	tstamp;
+	char	pkt[PVAL_PKT_LEN];
+} __attribute__((__packed__));
+
+
+struct pval_ring {
+	u8	cpu;
+	u32	head;	/* write point */
+	u32	tail;	/* read point */
+	u32	mask;	/* bit mask of the ring buffer */
+
+	struct pval_slot *slots;	/* array of pval slot */
+};
+#define PVAL_SLOT_NUM	1024	/* length of a ring (num of slots) */
+
+
+
+/* structure describing pval misc device. TX/RX on per CPU */
+#define PVAL_NAME_MAX	(IFNAMSIZ + 16)
+struct pval_mdev {
+	char	name[PVAL_NAME_MAX];	/* IFNAM-{tx|rx}-cpu-%d */
+	int	cpu;			/* CPU where this ring allocated */
+
+	struct pval_ring	ring;
+	struct miscdevice	mdev;
+};
+
+/* waitqueue for poll */
+static DECLARE_WAIT_QUEUE_HEAD(pval_wait);
+
+
 /* structure describing pval device */
+#define PVAL_MAX_CPUS	16
+
 struct pval_dev {
 	struct list_head	list;
 	struct rcu_head		rcu;
@@ -42,7 +88,15 @@ struct pval_dev {
 
 	/* @original_config: config before pval manipulates */
 	struct hwtstamp_config original_config;
+
+
+	/* misc device structures */
+	int num_cpus;
+	struct pval_mdev txmdevs[PVAL_MAX_CPUS];
+	struct pval_mdev rxmdevs[PVAL_MAX_CPUS];
 };
+#define pdev_tx_ring(pdev) &(pdev->txmdevs[smp_processor_id()].ring)
+#define pdev_rx_ring(pdev) &(pdev->rxmdevs[smp_processor_id()].ring)
 
 
 /* netns parameters */
@@ -51,6 +105,238 @@ static unsigned int pval_net_id;
 struct pval_net {
 	struct list_head	dev_list;	/* per netns pval dev list */
 };
+
+
+
+/* file operation to bring packets to user space */
+
+
+/* ring operations */
+static inline bool ring_emtpy(const struct pval_ring *r)
+{
+	return (r->head == r->tail);
+}
+
+static inline bool ring_full(const struct pval_ring *r)
+{
+	return (((r->head + 1) & r->mask) == r->tail);
+}
+
+static inline void ring_write_next(struct pval_ring *r)
+{
+	r->head = (r->head + 1) & r->mask;
+}
+
+static inline void ring_read_next(struct pval_ring *r)
+{
+	r->tail = (r->tail + 1) & r->mask;
+}
+
+static inline u32 ring_read_avail(const struct pval_ring *r)
+{
+	if (r->head > r->tail)
+		return r->head - r->tail;
+	if (r->tail > r->head)
+		return r->mask - r->tail + r->head + 1;
+	return 0;	// empty
+}
+
+static inline u32 ring_write_avail(const struct pval_ring *r)
+{
+	if (r->tail > r->head)
+		return r->tail - r->head;
+	if (r->head > r->tail)
+		return r->mask - r->head + r->tail + 1;
+	return 0;	// full
+}
+
+static inline ssize_t write_to_ring(struct pval_ring *r, struct sk_buff *skb)
+{
+	u32 pktlen = skb->mac_len + skb->len;
+	u32 copylen = pktlen > PVAL_PKT_LEN ? PVAL_PKT_LEN : pktlen;
+
+	if (ring_full(r))
+		return 0;
+
+	r->slots[r->head].len = copylen;
+	r->slots[r->head].tstamp = skb_hwtstamps(skb)->hwtstamp;
+	memcpy(r->slots[r->head].pkt, skb_mac_header(skb), copylen);
+	ring_write_next(r);
+
+	return copylen;
+}
+
+static int pval_file_open(struct inode *inode, struct file *filp)
+{
+	int cpu;
+	char devname[IFNAMSIZ], direct[16];
+	struct net_device *dev;
+	struct pval_dev *pdev;
+
+	if (sscanf(filp->f_path.dentry->d_name.name, "%s-%s-cpu-%d",
+		   devname, direct, &cpu) < 1) {
+		pr_err("failed to parse char dev %s\n",
+		       filp->f_path.dentry->d_name.name);
+		return -EINVAL;
+	}
+
+	dev = dev_get_by_name(&init_net, devname);
+	if (!dev) {
+		pr_err("net device %s not found\n", devname);
+		return -ENODEV;
+	}
+
+	if (dev->netdev_ops != &pdev_netdev_ops) {
+		pr_err("%s is not pval interface\n", devname);
+		return -EINVAL;
+	}
+
+	pdev = netdev_priv(dev);
+
+	if (cpu > pdev->num_cpus) {
+		pr_err("invalid cpu number %d of %s\n", cpu,
+			filp->f_path.dentry->d_name.name);
+		return -EINVAL;
+	}
+
+	if (strncmp(direct, "tx", 2) == 0)
+		filp->private_data = &pdev->txmdevs[cpu];
+	else if (strncmp(direct, "rx", 2) == 0)
+		filp->private_data = &pdev->rxmdevs[cpu];
+	else {
+		pr_err("invalid direction %s of %s\n", direct,
+		       filp->f_path.dentry->d_name.name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+
+static int
+pval_file_release(struct inode *inode, struct file *filp)
+{
+	filp->private_data = NULL;
+	return 0;
+}
+
+static ssize_t
+pval_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	ssize_t ret = 0;
+	size_t count = iter->nr_segs;
+	u32 avail, n, copylen, copynum;
+	struct file *filp = iocb->ki_filp;
+	struct pval_mdev *pmdev = (struct pval_mdev *)filp->private_data;
+	struct pval_ring *r = &pmdev->ring;
+	struct pval_slot *s;
+
+	if (unlikely(iter->type != ITER_IOVEC)) {
+		pr_err("unsupported iter type %d\n", iter->type);
+		return -EOPNOTSUPP;
+	}
+
+	if (ring_emtpy(r))
+		goto out;
+
+	avail = ring_read_avail(r);
+	copynum = avail > count ? count : avail;
+
+	for (n = 0; n < copynum ; n++) {
+		s = &r->slots[r->tail];
+		copylen = sizeof(struct pval_slot) > iter->iov[n].iov_len ?
+			iter->iov[n].iov_len : sizeof(struct pval_slot);
+		copy_to_user(iter->iov[n].iov_base, s, copylen);
+		ring_read_next(r);
+		ret++;
+	}
+
+out:
+	return ret;
+}
+
+static unsigned int pval_file_poll(struct file *file, poll_table *wait)
+{
+	struct pval_mdev *pmdev = (struct pval_mdev *)file->private_data;
+
+	poll_wait(file, &pval_wait, wait);
+	if (!ring_emtpy(&pmdev->ring))
+		return POLLIN | POLLRDNORM;
+
+	return 0;
+}
+
+static const struct file_operations pval_fops = {
+	.owner		= THIS_MODULE,
+	.open		= pval_file_open,
+	.release	= pval_file_release,
+	.read_iter	= pval_file_read_iter,
+	.poll		= pval_file_poll,
+};
+
+
+static int pval_init_ring(struct pval_ring *ring, int cpu)
+{
+	ring->cpu = cpu;
+	ring->head = 0;
+	ring->tail = 0;
+	ring->mask = PVAL_SLOT_NUM - 1;
+	ring->slots = kmalloc(sizeof(struct pval_slot) * PVAL_SLOT_NUM,
+			      GFP_KERNEL);
+	if (!ring->slots) {
+		pr_err("failed to kmalloc pval_slots for ring %d\n", cpu);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void pval_destroy_ring(struct pval_ring *ring)
+{
+	kfree(ring->slots);
+}
+
+static int pval_init_miscdevice(struct pval_mdev *pmdev, char *name, int cpu)
+{
+	int rc;
+
+	strncpy(pmdev->name, name, PVAL_NAME_MAX);
+	pmdev->mdev.name = pmdev->name;
+	pmdev->mdev.minor = MISC_DYNAMIC_MINOR;
+	pmdev->mdev.fops = &pval_fops;
+	pmdev->cpu = cpu;
+
+	rc = pval_init_ring(&pmdev->ring, cpu);
+	if (rc < 0) {
+		pr_err("failed to init ring on cpu %d for %s\n", cpu, name);
+		goto err_out;
+	}
+
+	rc = misc_register(&pmdev->mdev);
+	if (rc < 0) {
+		pr_err("failed to register misc device %s\n", name);
+		goto err_misc_dev;
+	}
+
+	pr_info("%s is registered \n", pmdev->name);
+
+	return 0;
+
+err_misc_dev:
+	pval_destroy_ring(&pmdev->ring);
+
+err_out:
+	return rc;
+}
+
+
+static void pval_destroy_miscdevice(struct pval_mdev *pmdev)
+{
+	misc_deregister(&pmdev->mdev);
+	pval_destroy_ring(&pmdev->ring);
+}
+
+
 
 /* misc from netmap pkt-gen */
 static uint16_t
@@ -179,7 +465,6 @@ rx_handler_result_t pdev_handle_frame(struct sk_buff **pskb)
 	struct sk_buff *skb = *pskb;
 	struct pval_dev *pdev = rcu_dereference(skb->dev->rx_handler_data);
 	
-	/* XXX: put the packet and rx hwtstamp to the buffer exposed to user */
 	skb = skb_share_check(skb, GFP_ATOMIC);
 	if (!skb)
 		return RX_HANDLER_CONSUMED;
@@ -187,6 +472,9 @@ rx_handler_result_t pdev_handle_frame(struct sk_buff **pskb)
 	*pskb = skb;
 	skb->dev = pdev->dev;
 	skb->pkt_type = PACKET_HOST;
+
+	if (pdev->rxcopy)
+		write_to_ring(pdev_rx_ring(pdev), skb);
 
 	return RX_HANDLER_ANOTHER;
 }
@@ -306,6 +594,9 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   sizeof(struct ipopt_pval),
 					   0));
 
+	if (pdev->txcopy)
+		write_to_ring(pdev_tx_ring(pdev), skb);
+
 	/* Xmit this packet through under device */
 xmit:
 	skb->dev = pdev->link;
@@ -421,7 +712,8 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 			struct nlattr *tb[], struct nlattr *data[],
 			struct netlink_ext_ack *extack)
 {
-	int err;
+	int err, n;
+	char name[PVAL_NAME_MAX];
 	u32 ifindex;
 	unsigned short needed_headroom;
 	struct net_device *link = NULL;
@@ -449,12 +741,15 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	}
 	pdev->link = link;
 
+	/* parse and configure device */
+	pval_nl_config(pdev, tb, data, extack);
+
 	/* headroom allocate */
 	needed_headroom = sizeof(struct ipopt_pval);
 	needed_headroom += link->needed_headroom;
 	dev->needed_headroom = needed_headroom;
 
-	/* register the device */
+	/* register ethernet device */
 	err = register_netdevice(dev);
 	if (err) {
 		netdev_err(dev, "failed to register netdevice %s\n",
@@ -466,9 +761,28 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	if (err)
 		goto unregister_netdev;
 
-	list_add_tail_rcu(&pdev->list, &pnet->dev_list);
+	/* register misc device */
+	pdev->num_cpus = PVAL_MAX_CPUS > num_possible_cpus() ?
+		num_possible_cpus() : PVAL_MAX_CPUS;
 
-	pval_nl_config(pdev, tb, data, extack);
+	for (n = 0; n < pdev->num_cpus; n++) {
+		/* XXX: should handle errors (free succseed mdevs )*/
+		snprintf(name, sizeof(name),
+			 "pval/%s-tx-cpu-%d", pdev->dev->name, n);
+		err = pval_init_miscdevice(&pdev->txmdevs[n], name, n);
+		if (err < 0)
+			goto unregister_netdev;
+
+		snprintf(name, sizeof(name),
+			 "pval/%s-rx-cpu-%d", pdev->dev->name, n);
+		err = pval_init_miscdevice(&pdev->rxmdevs[n], name, n);
+		if (err < 0)
+			goto unregister_netdev;
+	}
+
+
+	/* finished */
+	list_add_tail_rcu(&pdev->list, &pnet->dev_list);
 
 	return 0;
 
@@ -501,13 +815,20 @@ static int pval_changelink(struct net_device *dev, struct nlattr *tb[],
 
 static void pval_dellink(struct net_device *dev, struct list_head *head)
 {
+	int n;
 	struct pval_dev *pdev = netdev_priv(dev);
 
 	pval_restore_tstamp_config(pdev);
 	dev_put(pdev->link);
 	list_del_rcu(&pdev->list);
+
 	unregister_netdevice_queue(dev, head);
 	netdev_upper_dev_unlink(pdev->link, dev);
+
+	for (n = 0; n < pdev->num_cpus; n++) {
+		pval_destroy_miscdevice(&pdev->txmdevs[n]);
+		pval_destroy_miscdevice(&pdev->rxmdevs[n]);
+	}
 }
 
 
