@@ -55,7 +55,7 @@ $ ./ip/ip -d link show dev pval0
     pval link enp0s9 ipopt on txtstamp off rxtstamp off txcopy off rxcopy off addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 
 ```
 
-You can configure pval kernel module through `ip link set`. `ipopt on`
+You can configure pval interfaces through `ip link set`. `ipopt on`
 enables inserting Pval IP Option to transmitting packets. Other
 options are shown in the help (but not implemented currently).  These
 options can be specified at link creation by `ip link add`.
