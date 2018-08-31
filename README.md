@@ -84,3 +84,29 @@ tcpdump: listening on enp0s9, link-type EN10MB (Ethernet), capture size 262144 b
 
 ICMP echo reply packets from 10.0.0.3 (pval0) to 10.0.0.2 have Pval
 options.
+
+
+5. Gathring copied packets
+
+`txcopy` and `rxcopy` copy TXed and RXed packets through the pval
+interfaces. You can optain the copied packets from the Pval character
+devices.
+
+```shell-session
+$ ls /dev/pval
+pval0-rx-cpu-0	pval0-tx-cpu-0
+```
+
+After pval interfaces are created, you can see the associated charater
+devices at /dev/pval directory. The character devices are created for
+TX, RX for each CPU (queue). Applications can obtain the copied
+packets with hardware timestamps (when `txtstamp` and/or `rxtstamp`
+option is enabled on the interfaces, but not currently tested).
+
+Read API of the character device is a bit different from the
+traditional sysmte call. The API provides bulked packet read through
+the slightly modified usage of `writev()` system call.
+tools/dump-one.c is a sample application. An iovec contains a `struct
+pval_slot` as a structured buffer, and `writev()` returns how many
+packets are read. This method diverts schatter gather I/O to bulked
+packet transfer.
