@@ -64,8 +64,9 @@ options can be specified at link creation by `ip link add`.
 
 ### 4. What's happen
 
-Pval interface embeds IP Pval Option (experimental option 222) into
-all transmitted packets. pval/tcpdump is capable to see this option.
+`ipopt on` enables that Pval interface embeds IP Pval Option
+(experimental option 222) into all transmitted packets. pval/tcpdump
+is capable to see this option.
 
 ```shell-session
 $ sudo apt install libpcap-dev
@@ -90,7 +91,7 @@ options.
 ### 5. Gathring copied packets
 
 `txcopy` and `rxcopy` copy TXed and RXed packets through the pval
-interfaces. You can optain the copied packets from the Pval character
+interfaces. You can obtain the copied packets from the Pval character
 devices.
 
 ```shell-session
