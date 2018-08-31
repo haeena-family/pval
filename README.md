@@ -40,7 +40,7 @@ $ sudo ip addr add dev pval0 10.0.0.3/24
 ```
 
 pval0 interface enslaves enp0s9 ethernet interface. All packets
-receved from enp0s9 are received from pval0, and all transmitted
+received from enp0s9 are received from pval0, and all transmitted
 packets to pval0 are transmitted through enp0s9. This relationship is
 similar to ethernet and bridge interfaces.
 
@@ -58,7 +58,7 @@ $ ./ip/ip -d link show dev pval0
 You can configure pval interfaces through `ip link set`. For example,
 `ipopt on` enables inserting Pval IP Option to transmitting
 packets. Other options are shown in the help. Current configuration
-can be founed at `ip -d link show` output as shown in above. These
+can be found at `ip -d link show` output as shown in above. These
 options can be specified at link creation by `ip link add`.
 
 
@@ -99,18 +99,19 @@ $ ls /dev/pval
 pval0-rx-cpu-0	pval0-tx-cpu-0
 ```
 
-After pval interfaces are created, you can see the associated charater
-devices at /dev/pval directory. The character devices are created for
-TX, RX for each CPU (queue). Applications can obtain the copied
-packets with hardware timestamps (when `txtstamp` and/or `rxtstamp`
-option is enabled on the interfaces, but not currently tested).
+After pval interfaces are created, you can see the associated
+character devices at /dev/pval directory. The character devices are
+created for TX, RX for each CPU (queue). Applications can obtain the
+copied packets with hardware timestamps (when `txtstamp` and/or
+`rxtstamp` option is enabled on the interfaces, but not currently
+tested).
 
 Read API of the character device is a bit different from the
-traditional sysmte call. The API provides bulked packet read through
+traditional system call. The API provides bulked packet read through
 the slightly modified usage of `writev()` system call.
 tools/dump-one.c is a sample application. An iovec contains a `struct
 pval_slot` as a structured buffer, and `writev()` returns how many
-packets are read. This method diverts schatter gather I/O to bulked
+packets are read. This method diverts scatter gather I/O to bulked
 packet transfer.
 
 ```shell-session
