@@ -56,7 +56,14 @@ struct pval_mdev {
 
 	struct pval_ring	ring;
 	struct miscdevice	mdev;
+
+	/* worker for retriving TX tstamp */
+	unsigned long		txtstamp_start;
+	struct work_struct	txtstamp_work;
+	struct sk_buff		*cloned_skb;
 };
+#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 15)	/* as well as ixgbe */
+
 
 /* waitqueue for poll */
 static DECLARE_WAIT_QUEUE_HEAD(pval_wait);
@@ -168,6 +175,33 @@ static inline ssize_t write_to_ring(struct pval_ring *r, struct sk_buff *skb)
 	ring_write_next(r);
 
 	return copylen;
+}
+
+static void pval_txtstamp_work(struct work_struct *work)
+{
+	struct pval_mdev *pmdev = container_of(work, struct pval_mdev,
+					       txtstamp_work);
+	bool timeout = time_is_before_jiffies(pmdev->txtstamp_start +
+					      PVAL_TXTSTAMP_TIMEOUT);
+
+	if (!pmdev->cloned_skb)
+		return;
+
+	if (skb_hwtstamps(pmdev->cloned_skb)->hwtstamp != 0) {
+		write_to_ring(&pmdev->ring, pmdev->cloned_skb);
+		kfree_skb(pmdev->cloned_skb);
+		return;
+	}
+
+	if (timeout) {
+		kfree_skb(pmdev->cloned_skb);
+		pmdev->cloned_skb = NULL;
+		pr_err("retrieving txtstamp timeout on %s\n", pmdev->name);
+	} else {
+		/* reschedule to keep checking */
+		pr_info("%s: reschedule\n", __func__);
+		schedule_work(&pmdev->txtstamp_work);
+	}
 }
 
 static int pval_file_open(struct inode *inode, struct file *filp)
@@ -326,6 +360,7 @@ static int pval_init_miscdevice(struct pval_mdev *pmdev, char *name, int cpu)
 	strncpy(pmdev->name, name, PVAL_NAME_MAX);
 	pmdev->cpu		= cpu;
 	pmdev->opened		= false;
+	pmdev->cloned_skb	= NULL;
 	pmdev->mdev.name	= pmdev->name;
 	pmdev->mdev.minor	= MISC_DYNAMIC_MINOR;
 	pmdev->mdev.fops	= &pval_fops;
@@ -341,6 +376,8 @@ static int pval_init_miscdevice(struct pval_mdev *pmdev, char *name, int cpu)
 		pr_err("failed to register misc device %s\n", name);
 		goto err_misc_dev;
 	}
+
+	INIT_WORK(&pmdev->txtstamp_work, pval_txtstamp_work);
 
 	pr_info("%s is registered \n", pmdev->name);
 
@@ -584,10 +621,14 @@ static int pval_stop(struct net_device *dev)
 
 static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+	int rc;
 	struct pval_dev *pdev = netdev_priv(dev);
+	struct pval_mdev *pmdev = pdev_tx_pmdev(pdev);
 	struct ethhdr *eth_old, *eth_new;
 	struct iphdr *iph_old, *iph_new;
 	struct ipopt_pval *ipp;
+	struct sk_buff *clone = NULL;
+
 
 	if (!pdev->ipopt)
 		goto xmit;
@@ -632,13 +673,27 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   0));
 
 xmit:
-	/* XXX: Gather hwtstamp here */
-	if (pdev->txcopy && pdev_tx_pmdev(pdev)->opened)
-		write_to_ring(pdev_tx_ring(pdev), skb);
+	if (pdev->txtstamp) {
+		skb_shinfo(skb)->tx_flags |= SKBTX_HW_TSTAMP;
+		clone = skb_clone(skb, GFP_ATOMIC);
+		if (!clone)
+			return -ENOMEM;
+	}
 
 	/* Xmit this packet through under device */
 	skb->dev = pdev->link;
-	return dev_queue_xmit(skb);
+	rc = dev_queue_xmit(skb);
+
+	if (rc == NETDEV_TX_OK && pdev->txtstamp && pmdev->opened) {
+		if (!pmdev->cloned_skb)
+			pr_err("last TXed packet on cpu %d "
+			       "still waits txtstamp!\n", smp_processor_id());
+
+		pmdev->cloned_skb = clone;
+		schedule_work(&pmdev->txtstamp_work);
+	}
+
+	return rc;
 }
 
 
