@@ -29,7 +29,7 @@ void parse_and_print(struct pval_slot *slot)
 	
 	eth = (struct ethhdr *)slot->pkt;
 	printf("%02x:%02x:%02x:%02x:%02x:%02x -> "
-	       "%02x:%02x:%02x:%02x:%02x:%02x Type%04x",
+	       "%02x:%02x:%02x:%02x:%02x:%02x Type 0x%04x ",
 	       eth->h_source[0], eth->h_source[1], eth->h_source[2],
 	       eth->h_source[3], eth->h_source[4], eth->h_source[5],
 	       eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
@@ -39,7 +39,6 @@ void parse_and_print(struct pval_slot *slot)
 	if (ntohs(eth->h_proto) != ETH_P_IP)
 		goto out;
 
-	printf(", ");
 
 	iph = (struct iphdr *)(eth + 1);
 	inet_ntop(AF_INET, &iph->saddr, abuf1, sizeof(abuf1));

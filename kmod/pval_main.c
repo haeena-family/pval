@@ -398,7 +398,32 @@ wrapsum(u_int32_t sum)
 }
 
 
-#define netdev_ioctl(d, i, c) (d)->netdev_ops->ndo_do_ioctl(d, i, c)
+
+static int netdev_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+{
+	int rc;
+	mm_segment_t fs;
+
+	if (!dev->netdev_ops->ndo_do_ioctl) {
+		pr_err("%s does not have ndo_do_ioctl\n", dev->name);
+		return -ENOTSUPP;
+	}
+
+	fs = get_fs();
+	set_fs(get_ds());
+
+	/* XXX: ioctl is called in user context, so that ioctl
+	 * implementations uses copy_from/to_user for ifr->data. So,
+	 * switch FS segment register.
+	 */
+
+	rc = dev->netdev_ops->ndo_do_ioctl(dev, ifr, cmd);
+
+	set_fs(fs);
+
+	return rc;
+}
+
 
 static int pval_save_tstamp_config(struct pval_dev *pdev)
 {
@@ -406,20 +431,16 @@ static int pval_save_tstamp_config(struct pval_dev *pdev)
 	struct hwtstamp_config config;
 	struct ifreq ifr;
 
-	if (!pdev->link->netdev_ops->ndo_do_ioctl) {
-		pr_err("%s does not support ioctl\n", pdev->link->name);
-		return -EINVAL;
-	}
-
 	/* save the current hwtstamp config to pdev->original */
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, pdev->link->name, IFNAMSIZ);
 	ifr.ifr_data = &config;
 
 	rc = netdev_ioctl(pdev->link, &ifr, SIOCGHWTSTAMP);
+
 	if (rc) {
-		pr_err("%s: %s failed to get hwtstamp config\n",
-		       __func__, pdev->link->name);
+		pr_err("%s: %s failed to get hwtstamp config: %d\n",
+		       __func__, pdev->link->name, rc);
 		return rc;
 	}
 
@@ -433,11 +454,6 @@ static int pval_restore_tstamp_config(struct pval_dev *pdev)
 	int rc = 0;
 	struct ifreq ifr;
 
-	if (!pdev->link->netdev_ops->ndo_do_ioctl) {
-		pr_err("%s does not support ioctl\n", pdev->link->name);
-		return -EINVAL;
-	}
-
 	/* set the hwtstamp config from pdev->original_config */
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, pdev->link->name, IFNAMSIZ);
@@ -445,8 +461,8 @@ static int pval_restore_tstamp_config(struct pval_dev *pdev)
 
 	rc = netdev_ioctl(pdev->link, &ifr, SIOCSHWTSTAMP);
 	if (rc)
-		pr_err("%s: %s failed to set hwtstamp config\n",
-		       __func__, pdev->link->name);
+		pr_err("%s: %s failed to set hwtstamp config: %d\n",
+		       __func__, pdev->link->name, rc);
 
 	return rc;
 }
@@ -458,13 +474,11 @@ static int pval_set_tstamp_config(struct pval_dev *pdev)
 	struct hwtstamp_config config;
 	struct ifreq ifr;
 
-	if (!pdev->link->netdev_ops->ndo_do_ioctl) {
-		pr_err("%s does not support ioctl\n", pdev->link->name);
-		return -EINVAL;
-	}
-
 	/* set the hwtstamp config by pdev parameters */
-	memset(&config, 0, sizeof(config));
+	config.flags = 0;
+	config.tx_type = 0;
+	config.rx_filter = 0;
+
 	if (pdev->txtstamp)
 		config.tx_type = HWTSTAMP_TX_ON;
 	if (pdev->rxtstamp)
@@ -476,8 +490,8 @@ static int pval_set_tstamp_config(struct pval_dev *pdev)
 
 	rc = netdev_ioctl(pdev->link, &ifr, SIOCSHWTSTAMP);
 	if (rc)
-		pr_err("%s: %s failed to set hwtstamp config\n",
-		       __func__, pdev->link->name);
+		pr_err("%s: %s failed to set hwtstamp config: %d\n",
+		       __func__, pdev->link->name, rc);
 
 	return rc;
 }
@@ -542,7 +556,6 @@ static int pval_open(struct net_device *dev)
 	 * emulated e1000 devices do not suport hwtstamping.
 	 * Therefore, we ignore tstamp config errors.
 	 */
-	pval_save_tstamp_config(pdev);
 	pval_set_tstamp_config(pdev);
 
 	/* set link device all multi and promisc */
@@ -802,6 +815,8 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 			goto unregister_netdev;
 	}
 
+	/* save current hwtstamp config of lower link */
+	pval_save_tstamp_config(pdev);
 
 	/* finished */
 	list_add_tail_rcu(&pdev->list, &pnet->dev_list);
@@ -829,7 +844,6 @@ static int pval_changelink(struct net_device *dev, struct nlattr *tb[],
 	/* XXX: update tstamp config 
 	 * should handle pval_*_tstamp_config errors here.
 	 */
-	pval_restore_tstamp_config(pdev);
 	pval_set_tstamp_config(pdev);
 
 	return 0;

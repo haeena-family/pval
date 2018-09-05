@@ -14,7 +14,7 @@ $ sudo insmod pval.ko
 ### 2. Compile the modified iproute2
 
 ```shell-session
-$ sudo apt install xtables-addons-source flex bison
+$ sudo apt install pkg-config flex bison
 $ cd pval/iproute2-4.18.0
 $ ./configure
 $ make
