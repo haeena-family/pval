@@ -673,24 +673,41 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   0));
 
 xmit:
-	if (pdev->txtstamp) {
+	if (pdev->txtstamp || pdev->txcopy) {
 		skb_shinfo(skb)->tx_flags |= SKBTX_HW_TSTAMP;
 		clone = skb_clone(skb, GFP_ATOMIC);
 		if (!clone)
 			return -ENOMEM;
 	}
 
-	/* Xmit this packet through under device */
+	/* Xmit this packet through lower link */
 	skb->dev = pdev->link;
 	rc = dev_queue_xmit(skb);
 
-	if (rc == NETDEV_TX_OK && pdev->txtstamp && pmdev->opened) {
-		if (!pmdev->cloned_skb)
-			pr_err("last TXed packet on cpu %d "
-			       "still waits txtstamp!\n", smp_processor_id());
-
-		pmdev->cloned_skb = clone;
-		schedule_work(&pmdev->txtstamp_work);
+	if (rc == NETDEV_TX_OK) {
+		if (pdev->txtstamp && pmdev->opened) {
+			if (!pmdev->cloned_skb) {
+				pr_err("last TXed packet on cpu %d "
+				       "still waits txtstamp!\n",
+				       smp_processor_id());
+				kfree_skb(pmdev->cloned_skb);
+				/* XXX: should avoid race condition on
+				 * pmdev->cloned_skb between xmit
+				 * context and worker context.
+				 */
+			}
+			pmdev->cloned_skb = clone;
+			schedule_work(&pmdev->txtstamp_work);
+		} else if (pdev->txtstamp && !pdev->txcopy) {
+			/* cloned, but txtstamp_work is not scheduled,
+			 * so, free the cloned skb.
+			 */
+			kfree_skb(clone);
+		} else if (!pdev->txtstamp && pdev->txcopy) {
+			/* not timestamping, copy only */
+			write_to_ring(&pmdev->ring, clone);
+			kfree_skb(clone);
+		}
 	}
 
 	return rc;
