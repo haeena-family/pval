@@ -62,8 +62,9 @@ struct pval_mdev {
 	unsigned long		txtstamp_start;
 	struct work_struct	txtstamp_work;
 	struct sk_buff		*cloned_skb;
+	spinlock_t		txtstamp_lock;
 };
-#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 1)
+#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 2)
 
 
 /* waitqueue for poll */
@@ -676,12 +677,14 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 xmit:
 	/* we need a clone of this skb because txtstamp_work and
 	 * txcopy run after dev_queue_xmit().
+	 * XXX: skb_get() can substitute skb_clone()?
 	 */
 	if (pdev->txtstamp || pdev->txcopy) {
 		skb_shinfo(skb)->tx_flags |= SKBTX_HW_TSTAMP;
 		clone = skb_clone(skb, GFP_ATOMIC);
 		if (!clone) {
-			kfree_skb(skb);
+			//kfree_skb(skb);
+			pr_warn("clone failed\n");
 			return NETDEV_TX_BUSY;
 		}
 	}
@@ -692,6 +695,7 @@ xmit:
 		 * txbusydrop is enabled. Then, drop this packet.
 		 */
 		//kfree_skb(skb);
+		pr_warn("txstamp not finished\n");
 		return NETDEV_TX_BUSY;
 	}
 
@@ -715,6 +719,7 @@ xmit:
 				kfree_skb(pmdev->cloned_skb);
 			}
 			pmdev->cloned_skb = clone;
+			pmdev->txtstamp_start = jiffies;
 			schedule_work(&pmdev->txtstamp_work);
 
 		} else if (pdev->txcopy) {
