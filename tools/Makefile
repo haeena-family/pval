@@ -4,7 +4,7 @@ INCLUDE := -I../include/
 LDFLAGS := -pthread
 CFLAGS := -g -Wall $(INCLUDE)
 
-PROGNAME = dump-one
+PROGNAME = dump-one dump-multi
 
 all: $(PROGNAME)
 
