@@ -53,6 +53,7 @@ enum {
 /* pval_slot is stored in each iovec by readv() syscall */
 struct pval_slot {
 	__u32	len;
+	__u32	pktlen;
 	__u64	tstamp;
 	char	pkt[PVAL_PKT_LEN];
 } __attribute__((__packed__));

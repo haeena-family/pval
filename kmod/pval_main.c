@@ -63,7 +63,7 @@ struct pval_mdev {
 	struct work_struct	txtstamp_work;
 	struct sk_buff		*cloned_skb;
 };
-#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 5)	/* 5 sec */
+#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 1)
 
 
 /* waitqueue for poll */
@@ -171,6 +171,7 @@ static inline ssize_t write_to_ring(struct pval_ring *r, struct sk_buff *skb)
 	s = &r->slots[r->head];
 
 	s->len = copylen;
+	s->pktlen = pktlen;
 	s->tstamp = skb_hwtstamps(skb)->hwtstamp;
 	memcpy(s->pkt, skb_mac_header(skb), copylen);
 	ring_write_next(r);
@@ -690,7 +691,7 @@ xmit:
 		 * last packet still waits tx time stamp, but
 		 * txbusydrop is enabled. Then, drop this packet.
 		 */
-		kfree_skb(skb);
+		//kfree_skb(skb);
 		return NETDEV_TX_BUSY;
 	}
 
@@ -861,7 +862,7 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	pdev->rxtstamp		= false;
 	pdev->txcopy		= false;
 	pdev->rxcopy		= false;
-	pdev->txbusydrop	= false;
+	pdev->txbusydrop	= true; /* default true */
 	memset(&pdev->original_config, 0, sizeof(struct hwtstamp_config));
 
 	/* check underlay link */
