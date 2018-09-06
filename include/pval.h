@@ -29,8 +29,9 @@ enum {
 	IFLA_PVAL_IPOPT,	/* ON/OFF: add Pval IP Option */
 	IFLA_PVAL_TXTSTAMP,	/* ON/OFF: TX timestamping */
 	IFLA_PVAL_RXTSTAMP,	/* ON/OFF: RX timestamping */
-	IFLA_PVAL_TXCOPY,	/* ON/OFF: Copy TXed packets to user */
-	IFLA_PVAL_RXCOPY,	/* ON/OFF: Copy RXed packets to user */
+	IFLA_PVAL_TXCOPY,	/* ON/OFF: Copy TXed pkts to user */
+	IFLA_PVAL_RXCOPY,	/* ON/OFF: Copy RXed pkts to user */
+	IFLA_PVAL_TXBUSYDROP,	/* ON/OFF: Drop TXed pkts when tstamp busy */
 	__IFLA_PVAL_MAX
 };
 #define IFLA_PVAL_MAX	(__IFLA_PVAL_MAX - 1)

@@ -36,6 +36,7 @@ static void print_explain(FILE *f)
 		"                 [ rxtstamp { on | off } ]\n"
 		"                 [ txcopy { on | off } ]\n"
 		"                 [ rxcopy { on | off } ]\n"
+		"                 [ txbusydrop { on | off } ]\n"
 		);
 }
 
@@ -66,6 +67,8 @@ static int pval_parse_opt(struct link_util *lu, int argc, char **argv,
 				addattr8(n, 1024, IFLA_PVAL_IPOPT, 1);
 			else if (!matches(*argv, "off"))
 				addattr8(n, 1024, IFLA_PVAL_IPOPT, 0);
+			else
+				invarg("invalid parameter", *argv);
 		} else if (!matches(*argv, "txtstamp")) {
 			NEXT_ARG();
 			check_duparg(&attrs, IFLA_PVAL_TXTSTAMP, "txtstamp",
@@ -74,6 +77,8 @@ static int pval_parse_opt(struct link_util *lu, int argc, char **argv,
 				addattr8(n, 1024, IFLA_PVAL_TXTSTAMP, 1);
 			else if (!matches(*argv, "off"))
 				addattr8(n, 1024, IFLA_PVAL_TXTSTAMP, 0);
+			else
+				invarg("invalid parameter", *argv);
 		} else if (!matches(*argv, "rxtstamp")) {
 			NEXT_ARG();
 			check_duparg(&attrs, IFLA_PVAL_RXTSTAMP, "rxtstamp",
@@ -82,6 +87,8 @@ static int pval_parse_opt(struct link_util *lu, int argc, char **argv,
 				addattr8(n, 1024, IFLA_PVAL_RXTSTAMP, 1);
 			else if (!matches(*argv, "off"))
 				addattr8(n, 1024, IFLA_PVAL_RXTSTAMP, 0);
+			else
+				invarg("invalid parameter", *argv);
 		} else if (!matches(*argv, "txcopy")) {
 			NEXT_ARG();
 			check_duparg(&attrs, IFLA_PVAL_TXCOPY, "txcopy",
@@ -90,6 +97,8 @@ static int pval_parse_opt(struct link_util *lu, int argc, char **argv,
 				addattr8(n, 1024, IFLA_PVAL_TXCOPY, 1);
 			else if (!matches(*argv, "off"))
 				addattr8(n, 1024, IFLA_PVAL_TXCOPY, 0);
+			else
+				invarg("invalid parameter", *argv);
 		} else if (!matches(*argv, "rxcopy")) {
 			NEXT_ARG();
 			check_duparg(&attrs, IFLA_PVAL_RXCOPY, "rxcopy",
@@ -98,6 +107,18 @@ static int pval_parse_opt(struct link_util *lu, int argc, char **argv,
 				addattr8(n, 1024, IFLA_PVAL_RXCOPY, 1);
 			else if (!matches(*argv, "off"))
 				addattr8(n, 1024, IFLA_PVAL_RXCOPY, 0);
+			else
+				invarg("invalid parameter", *argv);
+		} else if (!matches(*argv, "txbusydrop")) {
+			NEXT_ARG();
+			check_duparg(&attrs, IFLA_PVAL_TXBUSYDROP,
+				     "txbusydrop", *argv);
+			if (!matches(*argv, "on"))
+				addattr8(n, 1024, IFLA_PVAL_TXBUSYDROP, 1);
+			else if (!matches(*argv, "off"))
+				addattr8(n, 1024, IFLA_PVAL_TXBUSYDROP, 0);
+			else
+				invarg("invalid parameter", *argv);
 		} else if (!matches(*argv, "help")) {
 			explain();
 			return -1;
@@ -155,6 +176,11 @@ static void pval_print_opt(struct link_util *lu, FILE *f, struct rtattr *tb[])
 	if (tb[IFLA_PVAL_RXCOPY]) {
 		r = rta_getattr_u8(tb[IFLA_PVAL_RXCOPY]) ? on : off;
 		print_string(PRINT_ANY, "rxcopy", "rxcopy %s ", r);
+	}
+
+	if (tb[IFLA_PVAL_TXBUSYDROP]) {
+		r = rta_getattr_u8(tb[IFLA_PVAL_TXBUSYDROP]) ? on : off;
+		print_string(PRINT_ANY, "txbusydrop", "txbusydrop %s ", r);
 	}
 }
 

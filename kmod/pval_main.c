@@ -47,6 +47,7 @@ struct pval_ring {
 /* structure describing pval misc device. TX/RX on per CPU */
 #define PVAL_NAME_MAX	(IFNAMSIZ + 16)
 struct pval_mdev {
+	struct pval_dev	*pdev;		/* parent */
 	char	name[PVAL_NAME_MAX];	/* IFNAM-{tx|rx}-cpu-%d */
 	int	cpu;			/* CPU where this ring allocated */
 	bool	opened;			/* This miscdev is opend.
@@ -62,7 +63,7 @@ struct pval_mdev {
 	struct work_struct	txtstamp_work;
 	struct sk_buff		*cloned_skb;
 };
-#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 15)	/* as well as ixgbe */
+#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 5)	/* 5 sec */
 
 
 /* waitqueue for poll */
@@ -81,12 +82,12 @@ struct pval_dev {
 	u64 __percpu		 seq;	/* sequence for TXed packets */
 
 	/* on/off switches for functionalities */
-	bool run;
 	bool ipopt;
 	bool txtstamp;
 	bool rxtstamp;
 	bool txcopy;
 	bool rxcopy;
+	bool txbusydrop;
 
 	/* @original_config: config before pval manipulates */
 	struct hwtstamp_config original_config;
@@ -184,12 +185,14 @@ static void pval_txtstamp_work(struct work_struct *work)
 	bool timeout = time_is_before_jiffies(pmdev->txtstamp_start +
 					      PVAL_TXTSTAMP_TIMEOUT);
 
-	if (!pmdev->cloned_skb)
+	if (unlikely(!pmdev->cloned_skb))
 		return;
 
 	if (skb_hwtstamps(pmdev->cloned_skb)->hwtstamp != 0) {
-		write_to_ring(&pmdev->ring, pmdev->cloned_skb);
+		if (pmdev->pdev->txcopy && pmdev->opened)
+			write_to_ring(&pmdev->ring, pmdev->cloned_skb);
 		kfree_skb(pmdev->cloned_skb);
+		pmdev->cloned_skb = NULL;
 		return;
 	}
 
@@ -353,11 +356,13 @@ static void pval_destroy_ring(struct pval_ring *ring)
 	kfree(ring->slots);
 }
 
-static int pval_init_miscdevice(struct pval_mdev *pmdev, char *name, int cpu)
+static int pval_init_miscdevice(struct pval_dev *pdev, struct pval_mdev *pmdev,
+				char *name, int cpu)
 {
 	int rc;
 
 	strncpy(pmdev->name, name, PVAL_NAME_MAX);
+	pmdev->pdev		= pdev;
 	pmdev->cpu		= cpu;
 	pmdev->opened		= false;
 	pmdev->cloned_skb	= NULL;
@@ -640,11 +645,6 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (ntohs(eth_old->h_proto) != ETH_P_IP)
 		goto xmit;
 
-	if (skb_cow_head(skb, sizeof(struct ipopt_pval))) {
-		pr_err("skb_cow_head failed\n");
-		kfree_skb(skb);
-		return NETDEV_TX_OK;
-	}
 	__skb_push(skb, sizeof(struct ipopt_pval));
 	skb_reset_mac_header(skb);
 	skb_set_network_header(skb, sizeof(struct ethhdr));
@@ -673,39 +673,53 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   0));
 
 xmit:
+	/* we need a clone of this skb because txtstamp_work and
+	 * txcopy run after dev_queue_xmit().
+	 */
 	if (pdev->txtstamp || pdev->txcopy) {
 		skb_shinfo(skb)->tx_flags |= SKBTX_HW_TSTAMP;
 		clone = skb_clone(skb, GFP_ATOMIC);
-		if (!clone)
-			return -ENOMEM;
+		if (!clone) {
+			kfree_skb(skb);
+			return NETDEV_TX_BUSY;
+		}
+	}
+
+	if (pdev->txtstamp && pmdev->cloned_skb && pdev->txbusydrop) {
+		/* we need to get tx time stamp of this packet, but
+		 * last packet still waits tx time stamp, but
+		 * txbusydrop is enabled. Then, drop this packet.
+		 */
+		kfree_skb(skb);
+		return NETDEV_TX_BUSY;
 	}
 
 	/* Xmit this packet through lower link */
 	skb->dev = pdev->link;
 	rc = dev_queue_xmit(skb);
 
+	/* xmit done. obtain tstamp and copy the packet */
 	if (rc == NETDEV_TX_OK) {
-		if (pdev->txtstamp && pmdev->opened) {
-			if (!pmdev->cloned_skb) {
+
+		/* at here, when txbusydrop is enabled,
+		 * pmdev->cloned_skb is always NULL.
+		 */
+
+		if (pdev->txtstamp) {
+			if (pmdev->cloned_skb) {
 				pr_err("last TXed packet on cpu %d "
-				       "still waits txtstamp!\n",
+				       "still waits txtstamp! overrun!\n",
 				       smp_processor_id());
+				cancel_work_sync(&pmdev->txtstamp_work);
 				kfree_skb(pmdev->cloned_skb);
-				/* XXX: should avoid race condition on
-				 * pmdev->cloned_skb between xmit
-				 * context and worker context.
-				 */
 			}
 			pmdev->cloned_skb = clone;
 			schedule_work(&pmdev->txtstamp_work);
-		} else if (pdev->txtstamp && !pdev->txcopy) {
-			/* cloned, but txtstamp_work is not scheduled,
-			 * so, free the cloned skb.
-			 */
-			kfree_skb(clone);
-		} else if (!pdev->txtstamp && pdev->txcopy) {
+
+		} else if (pdev->txcopy) {
 			/* not timestamping, copy only */
-			write_to_ring(&pmdev->ring, clone);
+			if (pmdev->opened)
+				write_to_ring(&pmdev->ring, clone);
 			kfree_skb(clone);
 		}
 	}
@@ -735,6 +749,12 @@ static struct device_type pval_type = {
 
 static const struct nla_policy pval_policy[IFLA_PVAL_MAX + 1] = {
 	[IFLA_PVAL_LINK]	= { .type = NLA_U32 },
+	[IFLA_PVAL_IPOPT]	= { .type = NLA_U8 },
+	[IFLA_PVAL_TXTSTAMP]	= { .type = NLA_U8 },
+	[IFLA_PVAL_RXTSTAMP]	= { .type = NLA_U8 },
+	[IFLA_PVAL_TXCOPY]	= { .type = NLA_U8 },
+	[IFLA_PVAL_RXCOPY]	= { .type = NLA_U8 },
+	[IFLA_PVAL_TXBUSYDROP]	= { .type = NLA_U8 },
 };
 
 static void pval_setup(struct net_device *dev) {
@@ -812,6 +832,13 @@ static int pval_nl_config(struct pval_dev *pdev,
 			pdev->rxcopy = false;
 	}
 	
+	if (data && data[IFLA_PVAL_TXBUSYDROP]) {
+		if (nla_get_u8(data[IFLA_PVAL_TXBUSYDROP]))
+			pdev->txbusydrop = true;
+		else
+			pdev->txbusydrop = false;
+	}
+
 	return 0;
 }
 
@@ -828,13 +855,13 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 	struct pval_dev *pdev = netdev_priv(dev);
 
 	/* initialize pdev parameters */
-	pdev->dev	= dev;
-	pdev->run	= false;
-	pdev->ipopt	= false;
-	pdev->txtstamp	= false;
-	pdev->rxtstamp	= false;
-	pdev->txcopy	= false;
-	pdev->rxcopy	= false;
+	pdev->dev		= dev;
+	pdev->ipopt		= false;
+	pdev->txtstamp		= false;
+	pdev->rxtstamp		= false;
+	pdev->txcopy		= false;
+	pdev->rxcopy		= false;
+	pdev->txbusydrop	= false;
 	memset(&pdev->original_config, 0, sizeof(struct hwtstamp_config));
 
 	/* check underlay link */
@@ -876,13 +903,13 @@ static int pval_newlink(struct net *src_net, struct net_device *dev,
 		/* XXX: should handle errors (free succseed mdevs )*/
 		snprintf(name, sizeof(name),
 			 "pval/%s-tx-cpu-%d", pdev->dev->name, n);
-		err = pval_init_miscdevice(&pdev->txmdevs[n], name, n);
+		err = pval_init_miscdevice(pdev, &pdev->txmdevs[n], name, n);
 		if (err < 0)
 			goto unregister_netdev;
 
 		snprintf(name, sizeof(name),
 			 "pval/%s-rx-cpu-%d", pdev->dev->name, n);
-		err = pval_init_miscdevice(&pdev->rxmdevs[n], name, n);
+		err = pval_init_miscdevice(pdev, &pdev->rxmdevs[n], name, n);
 		if (err < 0)
 			goto unregister_netdev;
 	}
@@ -967,6 +994,9 @@ static int pval_fill_info(struct sk_buff *skb, const struct net_device *dev)
 		return -EMSGSIZE;
 
 	if (nla_put_u8(skb, IFLA_PVAL_RXCOPY, pdev->rxcopy ? 1 : 0))
+		return -EMSGSIZE;
+
+	if (nla_put_u8(skb, IFLA_PVAL_TXBUSYDROP, pdev->txbusydrop ? 1 : 0))
 		return -EMSGSIZE;
 
 	return 0;
