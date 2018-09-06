@@ -64,7 +64,15 @@ struct pval_mdev {
 	struct sk_buff		*cloned_skb;
 	spinlock_t		txtstamp_lock;
 };
-#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 2)
+#define PVAL_TXTSTAMP_TIMEOUT	(HZ * 1)
+
+/* structure describing worker retrieving txtstamp from TXed skb */
+struct pval_worker {
+	struct work_struct	work;
+	struct sk_buff		*skb;
+	struct pval_ring	*ring;
+	unsigned long		start;
+};
 
 
 /* waitqueue for poll */
@@ -195,17 +203,46 @@ static void pval_txtstamp_work(struct work_struct *work)
 			write_to_ring(&pmdev->ring, pmdev->cloned_skb);
 		kfree_skb(pmdev->cloned_skb);
 		pmdev->cloned_skb = NULL;
+		//spin_unlock(&pmdev->txtstamp_lock);		
 		return;
 	}
 
 	if (timeout) {
+		pr_err("retrieving txtstamp timeout on %s\n", pmdev->name);
 		kfree_skb(pmdev->cloned_skb);
 		pmdev->cloned_skb = NULL;
-		pr_err("retrieving txtstamp timeout on %s\n", pmdev->name);
+		//spin_unlock(&pmdev->txtstamp_lock);
+
 	} else {
 		/* reschedule to keep checking */
 		pr_info("%s: reschedule\n", __func__);
 		schedule_work(&pmdev->txtstamp_work);
+	}
+}
+
+static void pval_txtstamp_work2(struct work_struct *work)
+{
+	/* XXX: use independent workqueue (not kqueue).  this may
+	 * causes segfault when kmod is removed and the workers left.
+	 */
+
+	struct pval_worker *worker = container_of(work, struct pval_worker,
+						  work);
+	bool timeout = time_is_before_jiffies(worker->start +
+					      PVAL_TXTSTAMP_TIMEOUT);
+
+	if (skb_hwtstamps(worker->skb)->hwtstamp != 0) {
+		write_to_ring(worker->ring, worker->skb);
+		kfree_skb(worker->skb);
+		kfree(worker);
+		return;
+	}
+
+	if (timeout) {
+		kfree_skb(worker->skb);;
+	} else {
+		pr_info("%s: reschedule\n", __func__);
+		schedule_work(&worker->work);
 	}
 }
 
@@ -385,6 +422,7 @@ static int pval_init_miscdevice(struct pval_dev *pdev, struct pval_mdev *pmdev,
 	}
 
 	INIT_WORK(&pmdev->txtstamp_work, pval_txtstamp_work);
+	spin_lock_init(&pmdev->txtstamp_lock);
 
 	pr_info("%s is registered \n", pmdev->name);
 
@@ -400,6 +438,8 @@ err_out:
 
 static void pval_destroy_miscdevice(struct pval_mdev *pmdev)
 {
+	//cancel_work_sync(&pmdev->txtstamp_work);
+	//spin_unlock(&pmdev->txtstamp_lock);
 	misc_deregister(&pmdev->mdev);
 	pval_destroy_ring(&pmdev->ring);
 }
@@ -635,7 +675,11 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct iphdr *iph_old, *iph_new;
 	struct ipopt_pval *ipp;
 	struct sk_buff *clone = NULL;
+	struct pval_worker *worker;
 
+
+	if (!(pdev->link->flags & IFF_UP))
+		return NETDEV_TX_BUSY;
 
 	if (!pdev->ipopt)
 		goto xmit;
@@ -674,29 +718,25 @@ static netdev_tx_t pval_xmit(struct sk_buff *skb, struct net_device *dev)
 					   sizeof(struct ipopt_pval),
 					   0));
 
+	skb_scrub_packet(skb, false);
+	skb_orphan(skb);
+
 xmit:
 	/* we need a clone of this skb because txtstamp_work and
 	 * txcopy run after dev_queue_xmit().
 	 * XXX: skb_get() can substitute skb_clone()?
 	 */
-	if (pdev->txtstamp || pdev->txcopy) {
+	
+	if (pdev->txtstamp)
 		skb_shinfo(skb)->tx_flags |= SKBTX_HW_TSTAMP;
+
+	if (pdev->txtstamp || pdev->txcopy) {
 		clone = skb_clone(skb, GFP_ATOMIC);
 		if (!clone) {
 			//kfree_skb(skb);
 			pr_warn("clone failed\n");
 			return NETDEV_TX_BUSY;
 		}
-	}
-
-	if (pdev->txtstamp && pmdev->cloned_skb && pdev->txbusydrop) {
-		/* we need to get tx time stamp of this packet, but
-		 * last packet still waits tx time stamp, but
-		 * txbusydrop is enabled. Then, drop this packet.
-		 */
-		//kfree_skb(skb);
-		pr_warn("txstamp not finished\n");
-		return NETDEV_TX_BUSY;
 	}
 
 	/* Xmit this packet through lower link */
@@ -711,16 +751,17 @@ xmit:
 		 */
 
 		if (pdev->txtstamp) {
-			if (pmdev->cloned_skb) {
-				pr_err("last TXed packet on cpu %d "
-				       "still waits txtstamp! overrun!\n",
-				       smp_processor_id());
-				cancel_work_sync(&pmdev->txtstamp_work);
-				kfree_skb(pmdev->cloned_skb);
+			worker = kmalloc(sizeof(struct pval_worker),
+					 GFP_ATOMIC);
+			if (!worker) {
+				pr_err("failed to allocate pval_worker\n");
+				return rc;
 			}
-			pmdev->cloned_skb = clone;
-			pmdev->txtstamp_start = jiffies;
-			schedule_work(&pmdev->txtstamp_work);
+			INIT_WORK(&worker->work, pval_txtstamp_work2);
+			worker->skb = clone;
+			worker->ring = &pmdev->ring;
+			worker->start = jiffies;
+			schedule_work(&worker->work);
 
 		} else if (pdev->txcopy) {
 			/* not timestamping, copy only */
@@ -774,7 +815,7 @@ static void pval_setup(struct net_device *dev) {
 	dev->needs_free_netdev = true;
 	dev->netdev_ops = &pdev_netdev_ops;
 	SET_NETDEV_DEVTYPE(dev,  &pval_type);
-	
+
         dev->features   |= NETIF_F_LLTX;
         //dev->features   |= NETIF_F_SG | NETIF_F_HW_CSUM;
         //dev->features   |= NETIF_F_RXCSUM;
