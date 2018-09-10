@@ -4,7 +4,7 @@ INCLUDE := -I../include/
 LDFLAGS := -pthread
 CFLAGS := -g -Wall $(INCLUDE)
 
-PROGNAME = tap_trial tun_trial
+PROGNAME = tap_trial tun_trial tap1
 
 all: $(PROGNAME)
 
